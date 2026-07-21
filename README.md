@@ -78,6 +78,10 @@ sudo ./launcher.sh          # interactive menu
 sudo ./launcher.sh auto     # detect, ask, run, then live dashboard
 ```
 
+<p align="center">
+  <img src="images/menu.png" alt="PLUGG terminal menu" width="720">
+</p>
+
 **Browser** (recommended, control it from your phone)
 
 ```bash
