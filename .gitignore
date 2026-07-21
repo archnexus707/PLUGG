@@ -1,0 +1,12 @@
+# runtime / generated
+__pycache__/
+*.pyc
+plugg.log
+
+# sensitive — hold live SSIDs / passwords, never commit
+plugg.conf
+profiles/
+
+# editor / os
+.DS_Store
+*.swp
