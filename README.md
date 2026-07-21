@@ -79,7 +79,7 @@ sudo ./launcher.sh auto     # detect, ask, run, then live dashboard
 ```
 
 <p align="center">
-  <img src="images/menu.png" alt="PLUGG terminal menu" width="720">
+  <img src="images/cli.png" alt="PLUGG live terminal dashboard" width="760">
 </p>
 
 **Browser** (recommended, control it from your phone)
