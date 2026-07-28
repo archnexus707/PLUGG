@@ -111,6 +111,13 @@ bands_of(){
   echo "${b:-?}"
 }
 has_5ghz(){ bands_of "$1" | grep -q 5; }
+# Check if the radio can actually use 5GHz for AP mode (NO-IR blocks beaconing on
+# some adapters like iwlwifi even though they detect 5GHz frequencies).
+can_do_5ghz_ap(){
+  local p; p="$(phy_of "$1")"; [ -z "$p" ] && return 1
+  supports_ap "$1" || return 1
+  iw phy "$p" info 2>/dev/null | grep -E '5[0-9]{3} MHz' | grep -qv 'no IR'
+}
 
 gen_pass(){ tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14; }
 detect_country(){ COUNTRY=$(iw reg get 2>/dev/null | sed -n 's/^country \([A-Z0-9]*\):.*/\1/p' | head -1); [ -z "$COUNTRY" ] || [ "$COUNTRY" = 00 ] && COUNTRY=US; }
@@ -169,8 +176,8 @@ autodetect(){
   for dev in $(wifi_ifaces); do is_usb_wifi "$dev" && is_connected "$dev" && { UPSTREAM="$dev"; break; }; done
   [ -z "$UPSTREAM" ] && for dev in $(wifi_ifaces); do is_usb_wifi "$dev" && { UPSTREAM="$dev"; break; }; done
   [ -z "$UPSTREAM" ] && for dev in $(wifi_ifaces); do is_connected "$dev" && { UPSTREAM="$dev"; break; }; done
-  # prefer a 5GHz-capable AP radio, then ath9k, then any AP-capable
-  for dev in $(wifi_ifaces); do [ "$dev" = "$UPSTREAM" ] && continue; supports_ap "$dev" && has_5ghz "$dev" && APIFACE="$dev"; done
+  # prefer a 5GHz AP-capable radio (avoids NO-IR restricted adapters), then ath9k, then any AP-capable
+  for dev in $(wifi_ifaces); do [ "$dev" = "$UPSTREAM" ] && continue; can_do_5ghz_ap "$dev" && APIFACE="$dev"; done
   [ -z "$APIFACE" ] && for dev in $(wifi_ifaces); do [ "$dev" = "$UPSTREAM" ] && continue; [ "$(driver_of "$dev")" = ath9k ] && supports_ap "$dev" && APIFACE="$dev"; done
   [ -z "$APIFACE" ] && for dev in $(wifi_ifaces); do [ "$dev" = "$UPSTREAM" ] && continue; supports_ap "$dev" && { APIFACE="$dev"; break; }; done
 }
@@ -218,14 +225,13 @@ ask_hotspot_settings(){
       custom) PASS=$(whiptail --passwordbox "Password (>=8 chars):" 9 55 3>&1 1>&2 2>&3);;
     esac
     # band choice, gated by AP radio capability
-    local apbands; apbands="$(bands_of "$APIFACE")"
-    if echo "$apbands" | grep -q 5; then
-      local bnd; bnd=$(whiptail --title "Band" --menu "AP radio ($APIFACE) supports: $apbands GHz" 12 62 2 \
+    if can_do_5ghz_ap "$APIFACE"; then
+      local bnd; bnd=$(whiptail --title "Band" --menu "AP radio ($APIFACE) freq options:" 12 62 2 \
         2.4 "widest range / best thru walls" 5 "faster, shorter range" 3>&1 1>&2 2>&3)
       [ "$bnd" = 5 ] && { BAND=a; HW=a; CHANNEL=36; } || { BAND=bg; HW=g; CHANNEL=6; }
     else
       BAND=bg; HW=g; CHANNEL=6
-      whiptail --title "Band" --msgbox "AP radio $APIFACE is 2.4GHz-only.\nUsing 2.4GHz (best range anyway)." 9 50
+      whiptail --title "Band" --msgbox "AP radio $APIFACE can't do 5GHz AP\n(stuck in 2.4GHz — best range anyway)." 9 50
     fi
     local w; w=$(whiptail --title "Security" --menu "Encryption" 11 60 2 \
       2 "WPA2 (works with everything)" 3 "WPA3/WPA2 (modern)" 3>&1 1>&2 2>&3); WPA_MODE="${w:-2}"
@@ -238,8 +244,8 @@ ask_hotspot_settings(){
     read -rp "  SSID [$SSID]: " x; SSID="${x:-$SSID}"
     read -rp "  Password ('random'=auto) [$PASS]: " x
     [ "$x" = random ] && { PASS="$(gen_pass)"; echo "   -> $PASS"; } || { [ -n "$x" ] && PASS="$x"; }
-    if has_5ghz "$APIFACE"; then read -rp "  Band 2.4/5 [2.4]: " x; [ "$x" = 5 ] && { BAND=a; HW=a; CHANNEL=36; } || { BAND=bg; HW=g; CHANNEL=6; }
-    else BAND=bg; HW=g; CHANNEL=6; echo "  (AP radio is 2.4GHz-only)"; fi
+    if can_do_5ghz_ap "$APIFACE"; then read -rp "  Band 2.4/5 [2.4]: " x; [ "$x" = 5 ] && { BAND=a; HW=a; CHANNEL=36; } || { BAND=bg; HW=g; CHANNEL=6; }
+    else BAND=bg; HW=g; CHANNEL=6; echo "  (AP radio can't do 5GHz AP — using 2.4GHz)"; fi
     read -rp "  Guest isolation yes/no [$ISOLATE]: " x; ISOLATE="${x:-$ISOLATE}"
     read -rp "  Auto-channel yes/no [$AUTOCHAN]: " x; AUTOCHAN="${x:-$AUTOCHAN}"
     read -rp "  Watchdog yes/no [$WATCHDOG]: " x; WATCHDOG="${x:-$WATCHDOG}"
@@ -373,7 +379,31 @@ assert_routing(){
 teardown_routing(){ local sub="$SUBNET.0/24"; [ -z "$SUBNET" ] && return
   ip rule del from "$sub" lookup "$RT_TABLE" 2>/dev/null; ip route flush table "$RT_TABLE" 2>/dev/null; ip route flush cache 2>/dev/null; }
 setup_firewall(){
-  local sub="$SUBNET.0/24"; echo 1 >/proc/sys/net/ipv4/ip_forward
+  local sub="$SUBNET.0/24"
+  #=============================================================================
+  #  INTERNET KILLER NEUTRALISATION
+  #-----------------------------------------------------------------------------
+  #  Machines with Docker, LXC, or custom firewall rules often set FORWARD
+  #  policy to DROP. This silently kills hotspot traffic because the nft
+  #  table accept verdict gets overridden by the higher-priority iptables-nft
+  #  FORWARD chain. We punch bidirectional ACCEPT rules at the top of FORWARD
+  #  so hotspot packets are accepted BEFORE any isolation chains see them.
+  #=============================================================================
+  echo 1 >/proc/sys/net/ipv4/ip_forward
+
+  command -v iptables >/dev/null && {
+    # remove stale rules first so we don't stack duplicates after restart
+    iptables -D FORWARD -s "$sub" -j ACCEPT -m comment --comment "plugg" 2>/dev/null
+    iptables -D FORWARD -d "$sub" -j ACCEPT -m comment --comment "plugg-return" 2>/dev/null
+    # insert at position 1 — before Docker / LXC / any custom chains
+    iptables -I FORWARD 1 -s "$sub" -j ACCEPT -m comment --comment "plugg"
+    iptables -I FORWARD 1 -d "$sub" -j ACCEPT -m comment --comment "plugg-return"
+  }
+
+  # rp_filter = 0|2 (off/loose) — strict mode (1) drops packets when the
+  # reply would go out a different interface (normal for multi-homed NAT).
+  sysctl -w net.ipv4.conf."$APIFACE".rp_filter=2 >/dev/null 2>&1
+
   if [ "$FW" = nft ]; then
     nft delete table ip $NFT_TABLE 2>/dev/null
     # NOTE: chain names must avoid nft keywords (e.g. 'fwd' is reserved), and every
@@ -410,6 +440,12 @@ EOF
   return 0
 }
 teardown_firewall(){
+  # remove the FORWARD ACCEPT rules we injected
+  local sub; sub="$(. "$CONF_FILE" 2>/dev/null; echo "$SUBNET")"; sub="${sub:-10.42.0}"
+  command -v iptables >/dev/null && {
+    iptables -D FORWARD -s "$sub.0/24" -j ACCEPT -m comment --comment "plugg" 2>/dev/null
+    iptables -D FORWARD -d "$sub.0/24" -j ACCEPT -m comment --comment "plugg-return" 2>/dev/null
+  }
   if [ "$FW" = nft ]; then nft delete table ip $NFT_TABLE 2>/dev/null
   else iptables-save 2>/dev/null | grep -v "$NFT_TABLE" | iptables-restore 2>/dev/null; fi
   echo 0 >/proc/sys/net/ipv4/ip_forward 2>/dev/null
@@ -482,6 +518,12 @@ start(){
   echo
   { echo "APIFACE=$APIFACE"; echo "UPSTREAM=$UPSTREAM"; echo "SUBNET=$SUBNET"; echo "WATCHDOG=$WATCHDOG"
     echo "NM_MANAGED=$(nmcli -g GENERAL.NM-MANAGED device show "$APIFACE" 2>/dev/null)"; } >"$STATE_FILE"
+
+  # validate band — fall back to 2.4G if the radio can't do 5G AP
+  if [ "$BAND" = a ] && ! can_do_5ghz_ap "$APIFACE"; then
+    warn "$APIFACE can't do 5GHz AP (NO-IR restriction) — falling back to 2.4GHz"
+    BAND=bg; HW=g; CHANNEL=6
+  fi
 
   # auto-channel BEFORE claiming the radio (needs it scannable)
   if [ "$AUTOCHAN" = yes ]; then
@@ -643,7 +685,7 @@ emit_detect_json(){
     "$(json_esc "$UPSTREAM")" "$(json_esc "$(ssid_of "$UPSTREAM")")" "$(bands_of "$UPSTREAM")" "$(json_esc "$(driver_of "$UPSTREAM")")" \
     "$(is_usb_wifi "$UPSTREAM" && echo true || echo false)" "$u_on" \
     "$(json_esc "$APIFACE")" "$(bands_of "$APIFACE")" "$(json_esc "$(driver_of "$APIFACE")")" \
-    "$(has_5ghz "$APIFACE" && echo true || echo false)"
+    "$(can_do_5ghz_ap "$APIFACE" && echo true || echo false)"
 }
 
 emit_status_json(){
